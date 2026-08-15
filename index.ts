@@ -15,7 +15,7 @@ import { Boom } from "@hapi/boom";
 import pino from "pino";
 import { randomUUID } from "crypto";
 import { supabase } from "./supabase";
-import { criarAuthStorePersistente } from "./authStore";
+import { criarAuthStorePersistente, listarVendedoresComSessao } from "./authStore";
 import { rodarBackupSeNecessario } from "./backup";
 import { processarGatilhoInatividade } from "./automacoes";
 
@@ -25,7 +25,13 @@ const BUCKET_MIDIA = "whatsapp-midia";
 
 type MidiaTipo = "imagem" | "audio" | "video" | "documento" | "localizacao" | "enquete";
 
-let socketAtual: WASocket | null = null;
+// Cada vendedor conecta o próprio número — uma sessão Baileys independente por vendedor_id.
+const sockets = new Map<string, WASocket>();
+const conectando = new Set<string>();
+
+function obterSocket(vendedorId: string): WASocket | null {
+  return sockets.get(vendedorId) ?? null;
+}
 
 function limparNumero(jidOuTexto: string) {
   return jidOuTexto.replace(/@.*/, "").replace(/\D/g, "");
@@ -35,8 +41,9 @@ function limparNumero(jidOuTexto: string) {
 // "ter sucesso" (retorna um id de mensagem) para um número que não é uma conta WhatsApp válida, e a
 // mensagem nunca chega em lugar nenhum. Tenta também a variante clássica do 9º dígito de celulares
 // brasileiros, já que alguns DDDs ainda causam ambiguidade nesse formato.
-async function resolverJid(numeroBruto: string): Promise<string | null> {
-  if (!socketAtual) return null;
+async function resolverJid(vendedorId: string, numeroBruto: string): Promise<string | null> {
+  const sock = obterSocket(vendedorId);
+  if (!sock) return null;
 
   const candidatos = new Set<string>([numeroBruto]);
   if (numeroBruto.startsWith("55") && numeroBruto.length === 13) {
@@ -47,7 +54,7 @@ async function resolverJid(numeroBruto: string): Promise<string | null> {
 
   for (const candidato of candidatos) {
     try {
-      const resultados = await socketAtual.onWhatsApp(candidato);
+      const resultados = await sock.onWhatsApp(candidato);
       const resultado = resultados?.[0];
       if (resultado?.exists && resultado.jid) return resultado.jid;
     } catch (err) {
@@ -134,19 +141,22 @@ function extrairTimestamp(msg: WAMessage): string {
   return new Date(millis).toISOString();
 }
 
-async function atualizarStatus(dados: { conectado?: boolean; numero_conectado?: string | null; qr_code?: string | null }) {
+async function atualizarStatus(
+  vendedorId: string,
+  dados: { conectado?: boolean; numero_conectado?: string | null; qr_code?: string | null }
+) {
   const { error } = await supabase
     .from("whatsapp_bridge_status")
-    .update({ ...dados, atualizado_em: new Date().toISOString() })
-    .eq("id", 1);
+    .upsert({ vendedor_id: vendedorId, ...dados, atualizado_em: new Date().toISOString() }, { onConflict: "vendedor_id" });
   if (error) console.error("[bridge] Erro ao atualizar status:", error.message);
 }
 
-async function vincularLead(conversaId: string, telefone: string) {
+async function vincularLead(conversaId: string, vendedorId: string, telefone: string) {
   const ultimosDigitos = telefone.slice(-8);
   const { data: leadMatch } = await supabase
     .from("leads")
     .select("id")
+    .eq("vendedor_id", vendedorId)
     .or(`telefone.ilike.%${ultimosDigitos}%,telefone_secundario.ilike.%${ultimosDigitos}%`)
     .limit(1)
     .maybeSingle();
@@ -158,13 +168,15 @@ async function vincularLead(conversaId: string, telefone: string) {
 
 const cacheConversas = new Map<string, { id: string; ultima_mensagem_em: string }>();
 
-async function garantirConversa(telefone: string, nomeContato: string | null) {
-  const emCache = cacheConversas.get(telefone);
+async function garantirConversa(vendedorId: string, telefone: string, nomeContato: string | null) {
+  const chaveCache = `${vendedorId}:${telefone}`;
+  const emCache = cacheConversas.get(chaveCache);
   if (emCache) return emCache;
 
   const { data: existente, error: erroSelect } = await supabase
     .from("whatsapp_conversas")
     .select("id, ultima_mensagem_em, lead_id, nome_contato")
+    .eq("vendedor_id", vendedorId)
     .eq("telefone", telefone)
     .maybeSingle();
 
@@ -178,13 +190,19 @@ async function garantirConversa(telefone: string, nomeContato: string | null) {
       await supabase.from("whatsapp_conversas").update({ nome_contato: nomeContato }).eq("id", existente.id);
     }
     const registro = { id: existente.id, ultima_mensagem_em: existente.ultima_mensagem_em };
-    cacheConversas.set(telefone, registro);
+    cacheConversas.set(chaveCache, registro);
     return registro;
   }
 
   const { data: nova, error: erroInsert } = await supabase
     .from("whatsapp_conversas")
-    .insert({ telefone, nome_contato: nomeContato, canal: "nao_oficial", ultima_mensagem_em: new Date(0).toISOString() })
+    .insert({
+      telefone,
+      vendedor_id: vendedorId,
+      nome_contato: nomeContato,
+      canal: "nao_oficial",
+      ultima_mensagem_em: new Date(0).toISOString(),
+    })
     .select("id, ultima_mensagem_em")
     .single();
 
@@ -193,12 +211,13 @@ async function garantirConversa(telefone: string, nomeContato: string | null) {
     return null;
   }
 
-  await vincularLead(nova.id, telefone);
-  cacheConversas.set(telefone, nova);
+  await vincularLead(nova.id, vendedorId, telefone);
+  cacheConversas.set(chaveCache, nova);
   return nova;
 }
 
 async function registrarMensagem(params: {
+  vendedorId: string;
   telefone: string;
   texto: string;
   nomeContato: string | null;
@@ -212,7 +231,7 @@ async function registrarMensagem(params: {
   midiaLat?: number | null;
   midiaLng?: number | null;
 }) {
-  const conversa = await garantirConversa(params.telefone, params.nomeContato);
+  const conversa = await garantirConversa(params.vendedorId, params.telefone, params.nomeContato);
   if (!conversa) return;
 
   const { error: erroMsg } = await supabase.from("whatsapp_mensagens").upsert(
@@ -263,7 +282,7 @@ async function processarLote<T>(itens: T[], concorrencia: number, tarefa: (item:
   await Promise.all(Array.from({ length: Math.min(concorrencia, itens.length) }, worker));
 }
 
-async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages: WAMessage[]) {
+async function sincronizarHistorico(vendedorId: string, chats: Chat[], contacts: Contact[], messages: WAMessage[]) {
   const nomesPorJid = new Map<string, string>();
   for (const c of contacts) {
     const nome = c.name || c.notify;
@@ -274,7 +293,7 @@ async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages
   await processarLote(chatsValidos, 5, async (chat) => {
     const telefone = limparNumero(chat.id);
     if (!telefone) return;
-    await garantirConversa(telefone, nomesPorJid.get(chat.id) ?? null);
+    await garantirConversa(vendedorId, telefone, nomesPorJid.get(chat.id) ?? null);
   });
 
   // Histórico não baixa o arquivo de mídia em si (custo/tempo) — só o texto/legenda fica registrado.
@@ -283,6 +302,7 @@ async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages
     const telefone = limparNumero(msg.key.remoteJid ?? "");
     if (!telefone) return;
     await registrarMensagem({
+      vendedorId,
       telefone,
       texto: extrairTexto(msg),
       nomeContato: nomesPorJid.get(msg.key.remoteJid ?? "") ?? msg.pushName ?? null,
@@ -293,109 +313,118 @@ async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages
     });
   });
 
-  console.log(`[bridge] Histórico sincronizado: ${chatsValidos.length} conversas, ${msgsValidas.length} mensagens processadas.`);
+  console.log(`[bridge] Vendedor ${vendedorId}: histórico sincronizado — ${chatsValidos.length} conversas, ${msgsValidas.length} mensagens processadas.`);
 }
 
-async function iniciarConexao() {
-  const { state, saveCreds } = await criarAuthStorePersistente();
+async function iniciarConexao(vendedorId: string) {
+  if (conectando.has(vendedorId)) return sockets.get(vendedorId) ?? null;
+  conectando.add(vendedorId);
 
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "warn" }),
-    printQRInTerminal: false,
-    syncFullHistory: true,
-    defaultQueryTimeoutMs: 120_000,
-  });
+  try {
+    const { state, saveCreds } = await criarAuthStorePersistente(vendedorId);
 
-  socketAtual = sock;
+    const sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: "warn" }),
+      printQRInTerminal: false,
+      syncFullHistory: true,
+      defaultQueryTimeoutMs: 120_000,
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    sockets.set(vendedorId, sock);
 
-  sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
-    console.log(`[bridge] Recebido lote de histórico (isLatest=${isLatest}): ${chats.length} chats, ${messages.length} mensagens.`);
-    await sincronizarHistorico(chats as Chat[], contacts as Contact[], messages as WAMessage[]);
-  });
+    sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
+      console.log(`[bridge] Vendedor ${vendedorId}: lote de histórico (isLatest=${isLatest}): ${chats.length} chats, ${messages.length} mensagens.`);
+      await sincronizarHistorico(vendedorId, chats as Chat[], contacts as Contact[], messages as WAMessage[]);
+    });
 
-    if (qr) {
-      const qrDataUrl = await QRCode.toDataURL(qr);
-      await atualizarStatus({ conectado: false, qr_code: qrDataUrl });
-      console.log("[bridge] Novo QR code gerado.");
-    }
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (connection === "open") {
-      const numero = sock.user?.id ? limparNumero(sock.user.id) : null;
-      await atualizarStatus({ conectado: true, numero_conectado: numero, qr_code: null });
-      console.log("[bridge] Conectado ao WhatsApp:", numero);
-    }
-
-    if (connection === "close") {
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const deslogado = statusCode === DisconnectReason.loggedOut;
-
-      await atualizarStatus({ conectado: false });
-      console.log("[bridge] Conexão fechada. Deslogado?", deslogado);
-
-      if (!deslogado) {
-        setTimeout(iniciarConexao, 3000);
-      }
-    }
-  });
-
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-
-    for (const msg of messages) {
-      if (!msg.message || !msg.key.remoteJid?.endsWith("@s.whatsapp.net")) continue; // ignora grupos, status e @lid
-
-      const telefone = limparNumero(msg.key.remoteJid ?? "");
-      if (!telefone) continue;
-
-      const direcao = msg.key.fromMe ? "saida" : "entrada";
-      const loc = conteudoNormalizado(msg)?.locationMessage;
-      const tipoMidia = detectarTipoMidia(msg);
-      const textoMsg = extrairTexto(msg);
-
-      // Envio multi-dispositivo gera ecos secundários sem conteúdo real (sender-key-distribution etc).
-      // Como as mensagens que nós mesmos enviamos via /enviar já são gravadas ali mesmo, ignora esses ecos vazios.
-      if (direcao === "saida" && textoMsg === "[mídia]" && !tipoMidia && !loc) continue;
-
-      let midiaUpload: { url: string; nome: string } | null = null;
-      if (tipoMidia) {
-        midiaUpload = await baixarEUpload(msg, tipoMidia);
+      if (qr) {
+        const qrDataUrl = await QRCode.toDataURL(qr);
+        await atualizarStatus(vendedorId, { conectado: false, qr_code: qrDataUrl });
+        console.log(`[bridge] Vendedor ${vendedorId}: novo QR code gerado.`);
       }
 
-      await registrarMensagem({
-        telefone,
-        texto: textoMsg,
-        nomeContato: msg.pushName ?? null,
-        direcao,
-        waMessageId: msg.key.id ?? null,
-        criadoEm: extrairTimestamp(msg),
-        contarNaoLida: direcao === "entrada",
-        midiaUrl: midiaUpload?.url ?? null,
-        midiaTipo: midiaUpload ? tipoMidia : loc ? "localizacao" : null,
-        midiaNome: midiaUpload?.nome ?? null,
-        midiaLat: loc?.degreesLatitude ?? null,
-        midiaLng: loc?.degreesLongitude ?? null,
-      });
-    }
-  });
+      if (connection === "open") {
+        const numero = sock.user?.id ? limparNumero(sock.user.id) : null;
+        await atualizarStatus(vendedorId, { conectado: true, numero_conectado: numero, qr_code: null });
+        console.log(`[bridge] Vendedor ${vendedorId}: conectado ao WhatsApp:`, numero);
+      }
 
-  return sock;
+      if (connection === "close") {
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const deslogado = statusCode === DisconnectReason.loggedOut;
+
+        sockets.delete(vendedorId);
+        conectando.delete(vendedorId);
+        await atualizarStatus(vendedorId, { conectado: false });
+        console.log(`[bridge] Vendedor ${vendedorId}: conexão fechada. Deslogado?`, deslogado);
+
+        if (!deslogado) {
+          setTimeout(() => iniciarConexao(vendedorId), 3000);
+        }
+      }
+    });
+
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of messages) {
+        if (!msg.message || !msg.key.remoteJid?.endsWith("@s.whatsapp.net")) continue; // ignora grupos, status e @lid
+
+        const telefone = limparNumero(msg.key.remoteJid ?? "");
+        if (!telefone) continue;
+
+        const direcao = msg.key.fromMe ? "saida" : "entrada";
+        const loc = conteudoNormalizado(msg)?.locationMessage;
+        const tipoMidia = detectarTipoMidia(msg);
+        const textoMsg = extrairTexto(msg);
+
+        // Envio multi-dispositivo gera ecos secundários sem conteúdo real (sender-key-distribution etc).
+        // Como as mensagens que nós mesmos enviamos via /enviar já são gravadas ali mesmo, ignora esses ecos vazios.
+        if (direcao === "saida" && textoMsg === "[mídia]" && !tipoMidia && !loc) continue;
+
+        let midiaUpload: { url: string; nome: string } | null = null;
+        if (tipoMidia) {
+          midiaUpload = await baixarEUpload(msg, tipoMidia);
+        }
+
+        await registrarMensagem({
+          vendedorId,
+          telefone,
+          texto: textoMsg,
+          nomeContato: msg.pushName ?? null,
+          direcao,
+          waMessageId: msg.key.id ?? null,
+          criadoEm: extrairTimestamp(msg),
+          contarNaoLida: direcao === "entrada",
+          midiaUrl: midiaUpload?.url ?? null,
+          midiaTipo: midiaUpload ? tipoMidia : loc ? "localizacao" : null,
+          midiaNome: midiaUpload?.nome ?? null,
+          midiaLat: loc?.degreesLatitude ?? null,
+          midiaLng: loc?.degreesLongitude ?? null,
+        });
+      }
+    });
+
+    return sock;
+  } finally {
+    conectando.delete(vendedorId);
+  }
 }
 
 // Processa um contato agendado de campanha por vez — o espaçamento entre disparos já foi
 // pré-calculado pelo CRM (agendado_para); aqui só respeitamos o relógio e enviamos quando chegar a vez.
+// Cada lead pertence a um vendedor, e o envio sai pela conexão WhatsApp *daquele* vendedor.
 async function processarCampanhas() {
-  if (!socketAtual) return;
-
   try {
     const { data: contatos, error } = await supabase
       .from("campanha_contatos")
-      .select("id, tentativas, campanha:campanhas!inner(status, canal, template_id), lead:leads(nome, telefone, telefone_secundario)")
+      .select("id, tentativas, campanha:campanhas!inner(status, canal, template_id), lead:leads(nome, telefone, telefone_secundario, vendedor_id)")
       .eq("status_envio", "agendado")
       .lte("agendado_para", new Date().toISOString())
       .eq("campanha.status", "ativa")
@@ -413,14 +442,24 @@ async function processarCampanhas() {
       id: string;
       tentativas: number;
       campanha: { template_id: string | null };
-      lead: { nome: string; telefone: string | null; telefone_secundario: string | null } | null;
+      lead: { nome: string; telefone: string | null; telefone_secundario: string | null; vendedor_id: string } | null;
     };
 
     const telefoneDestino = (contato.lead?.telefone || contato.lead?.telefone_secundario || "").replace(/\D/g, "");
-    if (!telefoneDestino) {
+    const vendedorId = contato.lead?.vendedor_id;
+
+    if (!telefoneDestino || !vendedorId) {
       await supabase
         .from("campanha_contatos")
-        .update({ status_envio: "erro", erro: "Lead sem telefone." })
+        .update({ status_envio: "erro", erro: "Lead sem telefone ou sem vendedor responsável." })
+        .eq("id", contato.id);
+      return;
+    }
+
+    if (!obterSocket(vendedorId)) {
+      await supabase
+        .from("campanha_contatos")
+        .update({ status_envio: "erro", erro: "O vendedor responsável por esse lead não tem WhatsApp conectado." })
         .eq("id", contato.id);
       return;
     }
@@ -438,9 +477,9 @@ async function processarCampanhas() {
     }
 
     try {
-      const jid = await resolverJid(telefoneDestino);
+      const jid = await resolverJid(vendedorId, telefoneDestino);
       if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
-      const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
+      const resultado = await obterSocket(vendedorId)!.sendMessage(jid, { text: mensagemTexto });
 
       await supabase
         .from("campanha_contatos")
@@ -448,6 +487,7 @@ async function processarCampanhas() {
         .eq("id", contato.id);
 
       await registrarMensagem({
+        vendedorId,
         telefone: telefoneDestino,
         texto: mensagemTexto,
         nomeContato: contato.lead?.nome ?? null,
@@ -457,7 +497,7 @@ async function processarCampanhas() {
         contarNaoLida: false,
       });
 
-      console.log(`[bridge] Campanha: mensagem enviada para ${telefoneDestino}`);
+      console.log(`[bridge] Campanha: mensagem enviada para ${telefoneDestino} (vendedor ${vendedorId}).`);
     } catch (err) {
       console.error("[bridge] Erro ao enviar mensagem de campanha:", err);
       await supabase
@@ -475,10 +515,9 @@ async function processarCampanhas() {
 }
 
 // X dias depois de um lead virar "fechado", marca como cliente e manda mensagem pedindo indicação —
-// uma vez só por lead (leads.indicacao_solicitada_em guarda o controle).
+// uma vez só por lead (leads.indicacao_solicitada_em guarda o controle). Sai pela conexão do vendedor
+// dono do lead.
 async function processarGatilhoIndicacao() {
-  if (!socketAtual) return;
-
   try {
     const { data: config } = await supabase.from("config_automacao").select("*").eq("id", 1).single();
     if (!config || !config.gatilho_indicacao_ativo || !config.gatilho_indicacao_template_id) return;
@@ -495,7 +534,7 @@ async function processarGatilhoIndicacao() {
 
     const { data: leadsElegiveis, error } = await supabase
       .from("leads")
-      .select("id, nome, telefone, telefone_secundario")
+      .select("id, nome, telefone, telefone_secundario, vendedor_id")
       .eq("etapa", "fechado")
       .is("indicacao_solicitada_em", null)
       .lt("atualizado_em", limite.toISOString())
@@ -509,14 +548,14 @@ async function processarGatilhoIndicacao() {
 
     for (const lead of leadsElegiveis) {
       const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
-      if (!telefoneDestino) continue;
+      if (!telefoneDestino || !obterSocket(lead.vendedor_id)) continue;
 
       const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "");
 
       try {
-        const jid = await resolverJid(telefoneDestino);
+        const jid = await resolverJid(lead.vendedor_id, telefoneDestino);
         if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
-        const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
+        const resultado = await obterSocket(lead.vendedor_id)!.sendMessage(jid, { text: mensagemTexto });
 
         await supabase
           .from("leads")
@@ -524,6 +563,7 @@ async function processarGatilhoIndicacao() {
           .eq("id", lead.id);
 
         await registrarMensagem({
+          vendedorId: lead.vendedor_id,
           telefone: telefoneDestino,
           texto: mensagemTexto,
           nomeContato: lead.nome ?? null,
@@ -544,7 +584,10 @@ async function processarGatilhoIndicacao() {
 }
 
 async function main() {
-  await iniciarConexao();
+  const vendedoresComSessao = await listarVendedoresComSessao();
+  console.log(`[bridge] Reconectando ${vendedoresComSessao.length} sessão(ões) salva(s)...`);
+  await Promise.all(vendedoresComSessao.map((vendedorId) => iniciarConexao(vendedorId)));
+
   setInterval(processarCampanhas, 20_000);
 
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
@@ -561,12 +604,32 @@ async function main() {
 
   app.get("/health", (_req, res) => res.json({ ok: true }));
 
+  // Inicia (ou reinicia) a conexão de um vendedor específico — gera QR code se ainda não tiver sessão salva.
+  app.post("/conectar", async (req, res) => {
+    if (req.header("x-bridge-key") !== BRIDGE_API_KEY) {
+      return res.status(401).json({ error: "Não autorizado." });
+    }
+
+    const { vendedorId } = req.body as { vendedorId?: string };
+    if (!vendedorId) {
+      return res.status(400).json({ error: "vendedorId é obrigatório." });
+    }
+
+    if (obterSocket(vendedorId)) {
+      return res.json({ ok: true, jaConectado: true });
+    }
+
+    iniciarConexao(vendedorId).catch((err) => console.error(`[bridge] Erro ao iniciar conexão de ${vendedorId}:`, err));
+    res.json({ ok: true, jaConectado: false });
+  });
+
   app.post("/enviar", async (req, res) => {
     if (req.header("x-bridge-key") !== BRIDGE_API_KEY) {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
     const {
+      vendedorId,
       telefone,
       texto,
       midiaUrl,
@@ -576,6 +639,7 @@ async function main() {
       longitude,
       enquete,
     } = req.body as {
+      vendedorId?: string;
       telefone?: string;
       texto?: string;
       midiaUrl?: string;
@@ -586,19 +650,23 @@ async function main() {
       enquete?: { pergunta: string; opcoes: string[] };
     };
 
+    if (!vendedorId) {
+      return res.status(400).json({ error: "vendedorId é obrigatório." });
+    }
     if (!telefone) {
       return res.status(400).json({ error: "telefone é obrigatório." });
     }
     if (!texto && !midiaUrl && latitude === undefined && !enquete) {
       return res.status(400).json({ error: "informe texto, mídia, localização ou enquete." });
     }
-    if (!socketAtual) {
-      return res.status(503).json({ error: "WhatsApp não conectado." });
+    const sock = obterSocket(vendedorId);
+    if (!sock) {
+      return res.status(503).json({ error: "Seu WhatsApp não está conectado." });
     }
 
     try {
       const numero = telefone.replace(/\D/g, "");
-      const jid = await resolverJid(numero);
+      const jid = await resolverJid(vendedorId, numero);
       if (!jid) {
         return res.status(422).json({ error: `Número ${numero} não tem conta no WhatsApp.` });
       }
@@ -620,7 +688,7 @@ async function main() {
         conteudo = { text: texto || "" };
       }
 
-      const resultado = await socketAtual.sendMessage(jid, conteudo);
+      const resultado = await sock.sendMessage(jid, conteudo);
       res.json({ ok: true, id: resultado?.key?.id ?? null });
     } catch (err) {
       console.error("[bridge] Erro ao enviar:", err);
