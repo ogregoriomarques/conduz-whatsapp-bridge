@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import QRCode from "qrcode";
-import makeWASocket, { DisconnectReason, type WASocket } from "@whiskeysockets/baileys";
+import makeWASocket, { DisconnectReason, type WASocket, type WAMessage, type Chat, type Contact } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import { supabase } from "./supabase";
@@ -16,58 +16,177 @@ function limparNumero(jidOuTexto: string) {
   return jidOuTexto.replace(/@.*/, "").replace(/\D/g, "");
 }
 
+function extrairTexto(msg: WAMessage): string {
+  const m = msg.message;
+  if (!m) return "[mídia]";
+  if (m.conversation) return m.conversation;
+  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
+  if (m.imageMessage) return m.imageMessage.caption || "[imagem]";
+  if (m.videoMessage) return m.videoMessage.caption || "[vídeo]";
+  if (m.audioMessage) return m.audioMessage.ptt ? "[áudio]" : "[arquivo de áudio]";
+  if (m.documentMessage) return `[documento] ${m.documentMessage.fileName ?? ""}`.trim();
+  if (m.stickerMessage) return "[figurinha]";
+  if (m.locationMessage) return "[localização]";
+  if (m.contactMessage) return "[contato compartilhado]";
+  return "[mídia]";
+}
+
+function extrairTimestamp(msg: WAMessage): string {
+  const ts = msg.messageTimestamp;
+  if (!ts) return new Date().toISOString();
+  const millis = (typeof ts === "number" ? ts : Number(ts)) * 1000;
+  return new Date(millis).toISOString();
+}
+
 async function atualizarStatus(dados: { conectado?: boolean; numero_conectado?: string | null; qr_code?: string | null }) {
-  await supabase
+  const { error } = await supabase
     .from("whatsapp_bridge_status")
     .update({ ...dados, atualizado_em: new Date().toISOString() })
     .eq("id", 1);
+  if (error) console.error("[bridge] Erro ao atualizar status:", error.message);
 }
 
-async function registrarMensagemRecebida(telefone: string, texto: string, nomeContato: string | null, direcao: "entrada" | "saida") {
-  const { data: conversa } = await supabase
+async function vincularLead(conversaId: string, telefone: string) {
+  const ultimosDigitos = telefone.slice(-8);
+  const { data: leadMatch } = await supabase
+    .from("leads")
+    .select("id")
+    .or(`telefone.ilike.%${ultimosDigitos}%,telefone_secundario.ilike.%${ultimosDigitos}%`)
+    .limit(1)
+    .maybeSingle();
+
+  if (leadMatch) {
+    await supabase.from("whatsapp_conversas").update({ lead_id: leadMatch.id }).eq("id", conversaId);
+  }
+}
+
+const cacheConversas = new Map<string, { id: string; ultima_mensagem_em: string }>();
+
+async function garantirConversa(telefone: string, nomeContato: string | null) {
+  const emCache = cacheConversas.get(telefone);
+  if (emCache) return emCache;
+
+  const { data: existente, error: erroSelect } = await supabase
     .from("whatsapp_conversas")
-    .upsert(
-      {
-        telefone,
-        nome_contato: nomeContato,
-        canal: "nao_oficial",
-        ultima_mensagem: texto,
-        ultima_mensagem_em: new Date().toISOString(),
-      },
-      { onConflict: "telefone" }
-    )
-    .select()
+    .select("id, ultima_mensagem_em, lead_id, nome_contato")
+    .eq("telefone", telefone)
+    .maybeSingle();
+
+  if (erroSelect) {
+    console.error("[bridge] Erro ao buscar conversa:", erroSelect.message);
+    return null;
+  }
+
+  if (existente) {
+    if (nomeContato && !existente.nome_contato) {
+      await supabase.from("whatsapp_conversas").update({ nome_contato: nomeContato }).eq("id", existente.id);
+    }
+    const registro = { id: existente.id, ultima_mensagem_em: existente.ultima_mensagem_em };
+    cacheConversas.set(telefone, registro);
+    return registro;
+  }
+
+  const { data: nova, error: erroInsert } = await supabase
+    .from("whatsapp_conversas")
+    .insert({ telefone, nome_contato: nomeContato, canal: "nao_oficial", ultima_mensagem_em: new Date(0).toISOString() })
+    .select("id, ultima_mensagem_em")
     .single();
 
+  if (erroInsert || !nova) {
+    console.error("[bridge] Erro ao criar conversa:", erroInsert?.message);
+    return null;
+  }
+
+  await vincularLead(nova.id, telefone);
+  cacheConversas.set(telefone, nova);
+  return nova;
+}
+
+async function registrarMensagem(params: {
+  telefone: string;
+  texto: string;
+  nomeContato: string | null;
+  direcao: "entrada" | "saida";
+  waMessageId: string | null;
+  criadoEm: string;
+  contarNaoLida: boolean;
+}) {
+  const conversa = await garantirConversa(params.telefone, params.nomeContato);
   if (!conversa) return;
 
-  if (!conversa.lead_id) {
-    const ultimosDigitos = telefone.slice(-8);
-    const { data: leadMatch } = await supabase
-      .from("leads")
-      .select("id")
-      .or(`telefone.ilike.%${ultimosDigitos}%,telefone_secundario.ilike.%${ultimosDigitos}%`)
-      .limit(1)
-      .maybeSingle();
+  const { error: erroMsg } = await supabase.from("whatsapp_mensagens").upsert(
+    {
+      conversa_id: conversa.id,
+      wa_message_id: params.waMessageId,
+      direcao: params.direcao,
+      texto: params.texto,
+      status: params.direcao === "entrada" ? "entregue" : "enviado",
+      criado_em: params.criadoEm,
+    },
+    { onConflict: "wa_message_id", ignoreDuplicates: true }
+  );
+  if (erroMsg) console.error("[bridge] Erro ao gravar mensagem:", erroMsg.message);
 
-    if (leadMatch) {
-      await supabase.from("whatsapp_conversas").update({ lead_id: leadMatch.id }).eq("id", conversa.id);
+  if (params.criadoEm > conversa.ultima_mensagem_em) {
+    const atualizacao: Record<string, unknown> = {
+      ultima_mensagem: params.texto,
+      ultima_mensagem_em: params.criadoEm,
+    };
+    if (params.contarNaoLida) {
+      const { data: atual } = await supabase.from("whatsapp_conversas").select("nao_lidas").eq("id", conversa.id).single();
+      atualizacao.nao_lidas = (atual?.nao_lidas ?? 0) + 1;
+    }
+    const { error: erroConversa } = await supabase.from("whatsapp_conversas").update(atualizacao).eq("id", conversa.id);
+    if (erroConversa) console.error("[bridge] Erro ao atualizar conversa:", erroConversa.message);
+    conversa.ultima_mensagem_em = params.criadoEm;
+  }
+}
+
+async function processarLote<T>(itens: T[], concorrencia: number, tarefa: (item: T) => Promise<void>) {
+  let indice = 0;
+  async function worker() {
+    while (indice < itens.length) {
+      const atual = itens[indice++];
+      try {
+        await tarefa(atual);
+      } catch (err) {
+        console.error("[bridge] Erro ao processar item do histórico:", err);
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(concorrencia, itens.length) }, worker));
+}
 
-  await supabase.from("whatsapp_mensagens").insert({
-    conversa_id: conversa.id,
-    direcao,
-    texto,
-    status: direcao === "entrada" ? "entregue" : "enviado",
+async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages: WAMessage[]) {
+  const nomesPorJid = new Map<string, string>();
+  for (const c of contacts) {
+    const nome = c.name || c.notify;
+    if (c.id && nome) nomesPorJid.set(c.id, nome);
+  }
+
+  const chatsValidos = chats.filter((c) => c.id && !c.id.endsWith("@g.us"));
+  await processarLote(chatsValidos, 5, async (chat) => {
+    const telefone = limparNumero(chat.id);
+    if (!telefone) return;
+    await garantirConversa(telefone, nomesPorJid.get(chat.id) ?? null);
   });
 
-  if (direcao === "entrada") {
-    await supabase
-      .from("whatsapp_conversas")
-      .update({ nao_lidas: (conversa.nao_lidas ?? 0) + 1 })
-      .eq("id", conversa.id);
-  }
+  const msgsValidas = messages.filter((m) => m.message && m.key.remoteJid && !m.key.remoteJid.endsWith("@g.us"));
+  await processarLote(msgsValidas, 5, async (msg) => {
+    const telefone = limparNumero(msg.key.remoteJid ?? "");
+    if (!telefone) return;
+    await registrarMensagem({
+      telefone,
+      texto: extrairTexto(msg),
+      nomeContato: nomesPorJid.get(msg.key.remoteJid ?? "") ?? msg.pushName ?? null,
+      direcao: msg.key.fromMe ? "saida" : "entrada",
+      waMessageId: msg.key.id ?? null,
+      criadoEm: extrairTimestamp(msg),
+      contarNaoLida: false,
+    });
+  });
+
+  console.log(`[bridge] Histórico sincronizado: ${chatsValidos.length} conversas, ${msgsValidas.length} mensagens processadas.`);
 }
 
 async function iniciarConexao() {
@@ -77,11 +196,18 @@ async function iniciarConexao() {
     auth: state,
     logger: pino({ level: "warn" }),
     printQRInTerminal: false,
+    syncFullHistory: true,
+    defaultQueryTimeoutMs: 120_000,
   });
 
   socketAtual = sock;
 
   sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
+    console.log(`[bridge] Recebido lote de histórico (isLatest=${isLatest}): ${chats.length} chats, ${messages.length} mensagens.`);
+    await sincronizarHistorico(chats as Chat[], contacts as Contact[], messages as WAMessage[]);
+  });
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -120,14 +246,16 @@ async function iniciarConexao() {
       const telefone = limparNumero(msg.key.remoteJid ?? "");
       if (!telefone) continue;
 
-      const texto =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        "[mídia]";
-
       const direcao = msg.key.fromMe ? "saida" : "entrada";
-      await registrarMensagemRecebida(telefone, texto, msg.pushName ?? null, direcao);
+      await registrarMensagem({
+        telefone,
+        texto: extrairTexto(msg),
+        nomeContato: msg.pushName ?? null,
+        direcao,
+        waMessageId: msg.key.id ?? null,
+        criadoEm: extrairTimestamp(msg),
+        contarNaoLida: direcao === "entrada",
+      });
     }
   });
 
