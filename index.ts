@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
+  normalizeMessageContent,
   type WASocket,
   type WAMessage,
   type Chat,
@@ -28,8 +29,15 @@ function limparNumero(jidOuTexto: string) {
   return jidOuTexto.replace(/@.*/, "").replace(/\D/g, "");
 }
 
+// Mensagens enviadas pelo próprio dispositivo (fromMe) e algumas outras variações
+// chegam embrulhadas em deviceSentMessage/ephemeralMessage/viewOnceMessage — desembrulha antes de ler.
+function conteudoNormalizado(msg: WAMessage) {
+  if (!msg.message) return null;
+  return normalizeMessageContent(msg.message);
+}
+
 function extrairTexto(msg: WAMessage): string {
-  const m = msg.message;
+  const m = conteudoNormalizado(msg);
   if (!m) return "[mídia]";
   if (m.conversation) return m.conversation;
   if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
@@ -44,7 +52,7 @@ function extrairTexto(msg: WAMessage): string {
 }
 
 function detectarTipoMidia(msg: WAMessage): MidiaTipo | null {
-  const m = msg.message;
+  const m = conteudoNormalizado(msg);
   if (!m) return null;
   if (m.imageMessage) return "imagem";
   if (m.videoMessage) return "video";
@@ -64,7 +72,7 @@ function extensaoPara(tipo: MidiaTipo, mimetype?: string | null): string {
 async function baixarEUpload(msg: WAMessage, tipo: MidiaTipo): Promise<{ url: string; nome: string } | null> {
   try {
     const buffer = (await downloadMediaMessage(msg, "buffer", {})) as Buffer;
-    const m = msg.message!;
+    const m = conteudoNormalizado(msg)!;
     const mimetype =
       tipo === "imagem" ? m.imageMessage?.mimetype
       : tipo === "video" ? m.videoMessage?.mimetype
@@ -318,7 +326,7 @@ async function iniciarConexao() {
       if (!telefone) continue;
 
       const direcao = msg.key.fromMe ? "saida" : "entrada";
-      const loc = msg.message.locationMessage;
+      const loc = conteudoNormalizado(msg)?.locationMessage;
       const tipoMidia = detectarTipoMidia(msg);
       let midiaUpload: { url: string; nome: string } | null = null;
       if (tipoMidia) {
