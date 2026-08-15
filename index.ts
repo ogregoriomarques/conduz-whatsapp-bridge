@@ -1,14 +1,26 @@
 import "dotenv/config";
 import express from "express";
 import QRCode from "qrcode";
-import makeWASocket, { DisconnectReason, type WASocket, type WAMessage, type Chat, type Contact } from "@whiskeysockets/baileys";
+import makeWASocket, {
+  DisconnectReason,
+  downloadMediaMessage,
+  type WASocket,
+  type WAMessage,
+  type Chat,
+  type Contact,
+  type AnyMessageContent,
+} from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
+import { randomUUID } from "crypto";
 import { supabase } from "./supabase";
 import { criarAuthStorePersistente } from "./authStore";
 
 const PORT = process.env.PORT || 3001;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
+const BUCKET_MIDIA = "whatsapp-midia";
+
+type MidiaTipo = "imagem" | "audio" | "video" | "documento" | "localizacao" | "enquete";
 
 let socketAtual: WASocket | null = null;
 
@@ -29,6 +41,54 @@ function extrairTexto(msg: WAMessage): string {
   if (m.locationMessage) return "[localização]";
   if (m.contactMessage) return "[contato compartilhado]";
   return "[mídia]";
+}
+
+function detectarTipoMidia(msg: WAMessage): MidiaTipo | null {
+  const m = msg.message;
+  if (!m) return null;
+  if (m.imageMessage) return "imagem";
+  if (m.videoMessage) return "video";
+  if (m.audioMessage) return "audio";
+  if (m.documentMessage) return "documento";
+  return null;
+}
+
+function extensaoPara(tipo: MidiaTipo, mimetype?: string | null): string {
+  if (mimetype?.includes("/")) {
+    const sub = mimetype.split("/")[1]?.split(";")[0];
+    if (sub) return sub;
+  }
+  return tipo === "imagem" ? "jpg" : tipo === "video" ? "mp4" : tipo === "audio" ? "ogg" : "bin";
+}
+
+async function baixarEUpload(msg: WAMessage, tipo: MidiaTipo): Promise<{ url: string; nome: string } | null> {
+  try {
+    const buffer = (await downloadMediaMessage(msg, "buffer", {})) as Buffer;
+    const m = msg.message!;
+    const mimetype =
+      tipo === "imagem" ? m.imageMessage?.mimetype
+      : tipo === "video" ? m.videoMessage?.mimetype
+      : tipo === "audio" ? m.audioMessage?.mimetype
+      : m.documentMessage?.mimetype;
+    const nomeOriginal = tipo === "documento" ? m.documentMessage?.fileName ?? undefined : undefined;
+    const ext = extensaoPara(tipo, mimetype ?? undefined);
+    const caminho = `entrada/${randomUUID()}.${ext}`;
+
+    const { error } = await supabase.storage.from(BUCKET_MIDIA).upload(caminho, buffer, {
+      contentType: mimetype ?? "application/octet-stream",
+      upsert: false,
+    });
+    if (error) {
+      console.error("[bridge] Erro ao subir mídia recebida:", error.message);
+      return null;
+    }
+
+    const { data } = supabase.storage.from(BUCKET_MIDIA).getPublicUrl(caminho);
+    return { url: data.publicUrl, nome: nomeOriginal ?? caminho.split("/").pop()! };
+  } catch (err) {
+    console.error("[bridge] Erro ao baixar mídia:", err);
+    return null;
+  }
 }
 
 function extrairTimestamp(msg: WAMessage): string {
@@ -110,6 +170,11 @@ async function registrarMensagem(params: {
   waMessageId: string | null;
   criadoEm: string;
   contarNaoLida: boolean;
+  midiaUrl?: string | null;
+  midiaTipo?: MidiaTipo | null;
+  midiaNome?: string | null;
+  midiaLat?: number | null;
+  midiaLng?: number | null;
 }) {
   const conversa = await garantirConversa(params.telefone, params.nomeContato);
   if (!conversa) return;
@@ -122,6 +187,11 @@ async function registrarMensagem(params: {
       texto: params.texto,
       status: params.direcao === "entrada" ? "entregue" : "enviado",
       criado_em: params.criadoEm,
+      midia_url: params.midiaUrl ?? null,
+      midia_tipo: params.midiaTipo ?? null,
+      midia_nome: params.midiaNome ?? null,
+      midia_lat: params.midiaLat ?? null,
+      midia_lng: params.midiaLng ?? null,
     },
     { onConflict: "wa_message_id", ignoreDuplicates: true }
   );
@@ -171,6 +241,7 @@ async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages
     await garantirConversa(telefone, nomesPorJid.get(chat.id) ?? null);
   });
 
+  // Histórico não baixa o arquivo de mídia em si (custo/tempo) — só o texto/legenda fica registrado.
   const msgsValidas = messages.filter((m) => m.message && m.key.remoteJid?.endsWith("@s.whatsapp.net"));
   await processarLote(msgsValidas, 5, async (msg) => {
     const telefone = limparNumero(msg.key.remoteJid ?? "");
@@ -247,6 +318,13 @@ async function iniciarConexao() {
       if (!telefone) continue;
 
       const direcao = msg.key.fromMe ? "saida" : "entrada";
+      const loc = msg.message.locationMessage;
+      const tipoMidia = detectarTipoMidia(msg);
+      let midiaUpload: { url: string; nome: string } | null = null;
+      if (tipoMidia) {
+        midiaUpload = await baixarEUpload(msg, tipoMidia);
+      }
+
       await registrarMensagem({
         telefone,
         texto: extrairTexto(msg),
@@ -255,6 +333,11 @@ async function iniciarConexao() {
         waMessageId: msg.key.id ?? null,
         criadoEm: extrairTimestamp(msg),
         contarNaoLida: direcao === "entrada",
+        midiaUrl: midiaUpload?.url ?? null,
+        midiaTipo: midiaUpload ? tipoMidia : loc ? "localizacao" : null,
+        midiaNome: midiaUpload?.nome ?? null,
+        midiaLat: loc?.degreesLatitude ?? null,
+        midiaLng: loc?.degreesLongitude ?? null,
       });
     }
   });
@@ -275,11 +358,32 @@ async function main() {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
-    const { telefone, texto } = req.body as { telefone?: string; texto?: string };
-    if (!telefone || !texto) {
-      return res.status(400).json({ error: "telefone e texto são obrigatórios." });
-    }
+    const {
+      telefone,
+      texto,
+      midiaUrl,
+      midiaTipo,
+      midiaNome,
+      latitude,
+      longitude,
+      enquete,
+    } = req.body as {
+      telefone?: string;
+      texto?: string;
+      midiaUrl?: string;
+      midiaTipo?: MidiaTipo;
+      midiaNome?: string;
+      latitude?: number;
+      longitude?: number;
+      enquete?: { pergunta: string; opcoes: string[] };
+    };
 
+    if (!telefone) {
+      return res.status(400).json({ error: "telefone é obrigatório." });
+    }
+    if (!texto && !midiaUrl && latitude === undefined && !enquete) {
+      return res.status(400).json({ error: "informe texto, mídia, localização ou enquete." });
+    }
     if (!socketAtual) {
       return res.status(503).json({ error: "WhatsApp não conectado." });
     }
@@ -287,7 +391,25 @@ async function main() {
     try {
       const numero = telefone.replace(/\D/g, "");
       const jid = `${numero}@s.whatsapp.net`;
-      const resultado = await socketAtual.sendMessage(jid, { text: texto });
+
+      let conteudo: AnyMessageContent;
+      if (midiaUrl && midiaTipo === "imagem") {
+        conteudo = { image: { url: midiaUrl }, caption: texto };
+      } else if (midiaUrl && midiaTipo === "video") {
+        conteudo = { video: { url: midiaUrl }, caption: texto };
+      } else if (midiaUrl && midiaTipo === "audio") {
+        conteudo = { audio: { url: midiaUrl }, mimetype: "audio/mp4" };
+      } else if (midiaUrl && midiaTipo === "documento") {
+        conteudo = { document: { url: midiaUrl }, mimetype: "application/octet-stream", fileName: midiaNome || "arquivo" };
+      } else if (latitude !== undefined && longitude !== undefined) {
+        conteudo = { location: { degreesLatitude: latitude, degreesLongitude: longitude } };
+      } else if (enquete) {
+        conteudo = { poll: { name: enquete.pergunta, values: enquete.opcoes, selectableCount: 1 } };
+      } else {
+        conteudo = { text: texto || "" };
+      }
+
+      const resultado = await socketAtual.sendMessage(jid, conteudo);
       res.json({ ok: true, id: resultado?.key?.id ?? null });
     } catch (err) {
       console.error("[bridge] Erro ao enviar:", err);
