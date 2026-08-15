@@ -646,6 +646,7 @@ async function main() {
       midiaUrl,
       midiaTipo,
       midiaNome,
+      midiaTipoConteudo,
       latitude,
       longitude,
       enquete,
@@ -656,6 +657,7 @@ async function main() {
       midiaUrl?: string;
       midiaTipo?: MidiaTipo;
       midiaNome?: string;
+      midiaTipoConteudo?: string;
       latitude?: number;
       longitude?: number;
       enquete?: { pergunta: string; opcoes: string[] };
@@ -684,13 +686,17 @@ async function main() {
 
       let conteudo: AnyMessageContent;
       if (midiaUrl && midiaTipo === "imagem") {
-        conteudo = { image: { url: midiaUrl }, caption: texto };
+        conteudo = { image: { url: midiaUrl }, caption: texto, mimetype: midiaTipoConteudo };
       } else if (midiaUrl && midiaTipo === "video") {
-        conteudo = { video: { url: midiaUrl }, caption: texto };
+        conteudo = { video: { url: midiaUrl }, caption: texto, mimetype: midiaTipoConteudo || "video/mp4" };
       } else if (midiaUrl && midiaTipo === "audio") {
-        conteudo = { audio: { url: midiaUrl }, mimetype: "audio/mp4" };
+        conteudo = { audio: { url: midiaUrl }, mimetype: midiaTipoConteudo || "audio/mp4" };
       } else if (midiaUrl && midiaTipo === "documento") {
-        conteudo = { document: { url: midiaUrl }, mimetype: "application/octet-stream", fileName: midiaNome || "arquivo" };
+        conteudo = {
+          document: { url: midiaUrl },
+          mimetype: midiaTipoConteudo || "application/octet-stream",
+          fileName: midiaNome || "arquivo",
+        };
       } else if (latitude !== undefined && longitude !== undefined) {
         conteudo = { location: { degreesLatitude: latitude, degreesLongitude: longitude } };
       } else if (enquete) {
