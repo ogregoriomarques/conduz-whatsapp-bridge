@@ -31,6 +31,32 @@ function limparNumero(jidOuTexto: string) {
   return jidOuTexto.replace(/@.*/, "").replace(/\D/g, "");
 }
 
+// Confirma no WhatsApp se o número existe antes de mandar mensagem — sem isso, sendMessage() pode
+// "ter sucesso" (retorna um id de mensagem) para um número que não é uma conta WhatsApp válida, e a
+// mensagem nunca chega em lugar nenhum. Tenta também a variante clássica do 9º dígito de celulares
+// brasileiros, já que alguns DDDs ainda causam ambiguidade nesse formato.
+async function resolverJid(numeroBruto: string): Promise<string | null> {
+  if (!socketAtual) return null;
+
+  const candidatos = new Set<string>([numeroBruto]);
+  if (numeroBruto.startsWith("55") && numeroBruto.length === 13) {
+    candidatos.add(numeroBruto.slice(0, 4) + numeroBruto.slice(5)); // remove o 9
+  } else if (numeroBruto.startsWith("55") && numeroBruto.length === 12) {
+    candidatos.add(numeroBruto.slice(0, 4) + "9" + numeroBruto.slice(4)); // adiciona o 9
+  }
+
+  for (const candidato of candidatos) {
+    try {
+      const resultados = await socketAtual.onWhatsApp(candidato);
+      const resultado = resultados?.[0];
+      if (resultado?.exists && resultado.jid) return resultado.jid;
+    } catch (err) {
+      console.error(`[bridge] Erro ao verificar número ${candidato} no WhatsApp:`, err);
+    }
+  }
+  return null;
+}
+
 // Mensagens enviadas pelo próprio dispositivo (fromMe) e algumas outras variações
 // chegam embrulhadas em deviceSentMessage/ephemeralMessage/viewOnceMessage — desembrulha antes de ler.
 function conteudoNormalizado(msg: WAMessage) {
@@ -412,7 +438,8 @@ async function processarCampanhas() {
     }
 
     try {
-      const jid = `${telefoneDestino}@s.whatsapp.net`;
+      const jid = await resolverJid(telefoneDestino);
+      if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
       const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
 
       await supabase
@@ -487,7 +514,8 @@ async function processarGatilhoIndicacao() {
       const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "");
 
       try {
-        const jid = `${telefoneDestino}@s.whatsapp.net`;
+        const jid = await resolverJid(telefoneDestino);
+        if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
         const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
 
         await supabase
@@ -570,7 +598,10 @@ async function main() {
 
     try {
       const numero = telefone.replace(/\D/g, "");
-      const jid = `${numero}@s.whatsapp.net`;
+      const jid = await resolverJid(numero);
+      if (!jid) {
+        return res.status(422).json({ error: `Número ${numero} não tem conta no WhatsApp.` });
+      }
 
       let conteudo: AnyMessageContent;
       if (midiaUrl && midiaTipo === "imagem") {
