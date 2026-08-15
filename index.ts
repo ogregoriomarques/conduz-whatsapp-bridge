@@ -528,65 +528,76 @@ async function processarCampanhas() {
 // dono do lead.
 async function processarGatilhoIndicacao() {
   try {
-    const { data: config } = await supabase.from("config_automacao").select("*").eq("id", 1).single();
-    if (!config || !config.gatilho_indicacao_ativo || !config.gatilho_indicacao_template_id) return;
-
-    const { data: template } = await supabase
-      .from("templates_mensagem")
-      .select("mensagem")
-      .eq("id", config.gatilho_indicacao_template_id)
-      .single();
-    if (!template?.mensagem) return;
-
-    const limite = new Date();
-    limite.setDate(limite.getDate() - config.gatilho_indicacao_dias);
-
-    const { data: leadsElegiveis, error } = await supabase
-      .from("leads")
-      .select("id, nome, telefone, telefone_secundario, vendedor_id")
-      .eq("etapa", "fechado")
-      .is("indicacao_solicitada_em", null)
-      .lt("atualizado_em", limite.toISOString())
-      .limit(20);
-
-    if (error) {
-      console.error("[automacao] Erro ao buscar leads elegíveis pra indicação:", error.message);
-      return;
-    }
-    if (!leadsElegiveis || leadsElegiveis.length === 0) return;
+    // Cada vendedor tem sua própria config (ativo/dias/mensagem) — processa uma leva por vendedor.
+    const { data: configs } = await supabase
+      .from("config_automacao")
+      .select("*")
+      .eq("gatilho_indicacao_ativo", true)
+      .not("gatilho_indicacao_template_id", "is", null);
+    if (!configs || configs.length === 0) return;
 
     const nomeEmpresa = await obterNomeEmpresa();
 
-    for (const lead of leadsElegiveis) {
-      const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
-      if (!telefoneDestino || !obterSocket(lead.vendedor_id)) continue;
+    for (const config of configs) {
+      const { data: template } = await supabase
+        .from("templates_mensagem")
+        .select("mensagem")
+        .eq("id", config.gatilho_indicacao_template_id)
+        .single();
+      if (!template?.mensagem) continue;
 
-      const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "").replace(/\{empresa\}/g, nomeEmpresa);
+      const limite = new Date();
+      limite.setDate(limite.getDate() - config.gatilho_indicacao_dias);
 
-      try {
-        const jid = await resolverJid(lead.vendedor_id, telefoneDestino);
-        if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
-        const resultado = await obterSocket(lead.vendedor_id)!.sendMessage(jid, { text: mensagemTexto });
+      const { data: leadsElegiveis, error } = await supabase
+        .from("leads")
+        .select("id, nome, telefone, telefone_secundario, vendedor_id")
+        .eq("vendedor_id", config.vendedor_id)
+        .eq("etapa", "fechado")
+        .is("indicacao_solicitada_em", null)
+        .lt("atualizado_em", limite.toISOString())
+        .limit(20);
 
-        await supabase
-          .from("leads")
-          .update({ cliente: true, indicacao_solicitada_em: new Date().toISOString() })
-          .eq("id", lead.id);
+      if (error) {
+        console.error(
+          `[automacao] Erro ao buscar leads elegíveis pra indicação (vendedor ${config.vendedor_id}):`,
+          error.message
+        );
+        continue;
+      }
+      if (!leadsElegiveis || leadsElegiveis.length === 0) continue;
 
-        await registrarMensagem({
-          vendedorId: lead.vendedor_id,
-          telefone: telefoneDestino,
-          texto: mensagemTexto,
-          nomeContato: lead.nome ?? null,
-          direcao: "saida",
-          waMessageId: resultado?.key?.id ?? null,
-          criadoEm: new Date().toISOString(),
-          contarNaoLida: false,
-        });
+      for (const lead of leadsElegiveis) {
+        const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
+        if (!telefoneDestino || !obterSocket(lead.vendedor_id)) continue;
 
-        console.log(`[automacao] Indicação solicitada para ${lead.nome} (${telefoneDestino}).`);
-      } catch (err) {
-        console.error(`[automacao] Erro ao enviar pedido de indicação para ${telefoneDestino}:`, err);
+        const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "").replace(/\{empresa\}/g, nomeEmpresa);
+
+        try {
+          const jid = await resolverJid(lead.vendedor_id, telefoneDestino);
+          if (!jid) throw new Error(`Número ${telefoneDestino} não tem conta no WhatsApp.`);
+          const resultado = await obterSocket(lead.vendedor_id)!.sendMessage(jid, { text: mensagemTexto });
+
+          await supabase
+            .from("leads")
+            .update({ cliente: true, indicacao_solicitada_em: new Date().toISOString() })
+            .eq("id", lead.id);
+
+          await registrarMensagem({
+            vendedorId: lead.vendedor_id,
+            telefone: telefoneDestino,
+            texto: mensagemTexto,
+            nomeContato: lead.nome ?? null,
+            direcao: "saida",
+            waMessageId: resultado?.key?.id ?? null,
+            criadoEm: new Date().toISOString(),
+            contarNaoLida: false,
+          });
+
+          console.log(`[automacao] Indicação solicitada para ${lead.nome} (${telefoneDestino}).`);
+        } catch (err) {
+          console.error(`[automacao] Erro ao enviar pedido de indicação para ${telefoneDestino}:`, err);
+        }
       }
     }
   } catch (err) {
