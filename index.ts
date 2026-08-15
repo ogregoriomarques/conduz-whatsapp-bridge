@@ -17,6 +17,7 @@ import { randomUUID } from "crypto";
 import { supabase } from "./supabase";
 import { criarAuthStorePersistente } from "./authStore";
 import { rodarBackupSeNecessario } from "./backup";
+import { processarGatilhoInatividade } from "./automacoes";
 
 const PORT = process.env.PORT || 3001;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
@@ -451,8 +452,10 @@ async function main() {
   setInterval(processarCampanhas, 20_000);
 
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
+  processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho inicial:", err));
   setInterval(() => {
     rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup:", err));
+    processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho:", err));
   }, 60 * 60 * 1000);
 
   const app = express();
