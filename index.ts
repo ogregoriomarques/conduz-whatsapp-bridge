@@ -447,15 +447,85 @@ async function processarCampanhas() {
   }
 }
 
+// X dias depois de um lead virar "fechado", marca como cliente e manda mensagem pedindo indicação —
+// uma vez só por lead (leads.indicacao_solicitada_em guarda o controle).
+async function processarGatilhoIndicacao() {
+  if (!socketAtual) return;
+
+  try {
+    const { data: config } = await supabase.from("config_automacao").select("*").eq("id", 1).single();
+    if (!config || !config.gatilho_indicacao_ativo || !config.gatilho_indicacao_template_id) return;
+
+    const { data: template } = await supabase
+      .from("templates_mensagem")
+      .select("mensagem")
+      .eq("id", config.gatilho_indicacao_template_id)
+      .single();
+    if (!template?.mensagem) return;
+
+    const limite = new Date();
+    limite.setDate(limite.getDate() - config.gatilho_indicacao_dias);
+
+    const { data: leadsElegiveis, error } = await supabase
+      .from("leads")
+      .select("id, nome, telefone, telefone_secundario")
+      .eq("etapa", "fechado")
+      .is("indicacao_solicitada_em", null)
+      .lt("atualizado_em", limite.toISOString())
+      .limit(20);
+
+    if (error) {
+      console.error("[automacao] Erro ao buscar leads elegíveis pra indicação:", error.message);
+      return;
+    }
+    if (!leadsElegiveis || leadsElegiveis.length === 0) return;
+
+    for (const lead of leadsElegiveis) {
+      const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
+      if (!telefoneDestino) continue;
+
+      const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "");
+
+      try {
+        const jid = `${telefoneDestino}@s.whatsapp.net`;
+        const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
+
+        await supabase
+          .from("leads")
+          .update({ cliente: true, indicacao_solicitada_em: new Date().toISOString() })
+          .eq("id", lead.id);
+
+        await registrarMensagem({
+          telefone: telefoneDestino,
+          texto: mensagemTexto,
+          nomeContato: lead.nome ?? null,
+          direcao: "saida",
+          waMessageId: resultado?.key?.id ?? null,
+          criadoEm: new Date().toISOString(),
+          contarNaoLida: false,
+        });
+
+        console.log(`[automacao] Indicação solicitada para ${lead.nome} (${telefoneDestino}).`);
+      } catch (err) {
+        console.error(`[automacao] Erro ao enviar pedido de indicação para ${telefoneDestino}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error("[automacao] Erro no gatilho de indicação:", err);
+  }
+}
+
 async function main() {
   await iniciarConexao();
   setInterval(processarCampanhas, 20_000);
 
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
   processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho inicial:", err));
+  processarGatilhoIndicacao().catch((err) => console.error("[automacao] Erro no gatilho de indicação inicial:", err));
   setInterval(() => {
     rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup:", err));
     processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho:", err));
+    processarGatilhoIndicacao().catch((err) => console.error("[automacao] Erro no gatilho de indicação:", err));
   }, 60 * 60 * 1000);
 
   const app = express();
