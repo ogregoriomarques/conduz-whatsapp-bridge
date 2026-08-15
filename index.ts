@@ -16,6 +16,7 @@ import pino from "pino";
 import { randomUUID } from "crypto";
 import { supabase } from "./supabase";
 import { criarAuthStorePersistente } from "./authStore";
+import { rodarBackupSeNecessario } from "./backup";
 
 const PORT = process.env.PORT || 3001;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
@@ -448,6 +449,11 @@ async function processarCampanhas() {
 async function main() {
   await iniciarConexao();
   setInterval(processarCampanhas, 20_000);
+
+  rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
+  setInterval(() => {
+    rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup:", err));
+  }, 60 * 60 * 1000);
 
   const app = express();
   app.use(express.json());
