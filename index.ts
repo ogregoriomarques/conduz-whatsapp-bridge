@@ -359,8 +359,95 @@ async function iniciarConexao() {
   return sock;
 }
 
+// Processa um contato agendado de campanha por vez — o espaçamento entre disparos já foi
+// pré-calculado pelo CRM (agendado_para); aqui só respeitamos o relógio e enviamos quando chegar a vez.
+async function processarCampanhas() {
+  if (!socketAtual) return;
+
+  try {
+    const { data: contatos, error } = await supabase
+      .from("campanha_contatos")
+      .select("id, tentativas, campanha:campanhas!inner(status, canal, template_id), lead:leads(nome, telefone, telefone_secundario)")
+      .eq("status_envio", "agendado")
+      .lte("agendado_para", new Date().toISOString())
+      .eq("campanha.status", "ativa")
+      .eq("campanha.canal", "nao_oficial")
+      .order("agendado_para", { ascending: true })
+      .limit(1);
+
+    if (error) {
+      console.error("[bridge] Erro ao buscar campanhas agendadas:", error.message);
+      return;
+    }
+    if (!contatos || contatos.length === 0) return;
+
+    const contato = contatos[0] as unknown as {
+      id: string;
+      tentativas: number;
+      campanha: { template_id: string | null };
+      lead: { nome: string; telefone: string | null; telefone_secundario: string | null } | null;
+    };
+
+    const telefoneDestino = (contato.lead?.telefone || contato.lead?.telefone_secundario || "").replace(/\D/g, "");
+    if (!telefoneDestino) {
+      await supabase
+        .from("campanha_contatos")
+        .update({ status_envio: "erro", erro: "Lead sem telefone." })
+        .eq("id", contato.id);
+      return;
+    }
+
+    await supabase.from("campanha_contatos").update({ status_envio: "enviando" }).eq("id", contato.id);
+
+    let mensagemTexto = "";
+    if (contato.campanha.template_id) {
+      const { data: template } = await supabase
+        .from("templates_mensagem")
+        .select("mensagem")
+        .eq("id", contato.campanha.template_id)
+        .single();
+      mensagemTexto = (template?.mensagem ?? "").replace(/\{nome\}/g, contato.lead?.nome ?? "");
+    }
+
+    try {
+      const jid = `${telefoneDestino}@s.whatsapp.net`;
+      const resultado = await socketAtual!.sendMessage(jid, { text: mensagemTexto });
+
+      await supabase
+        .from("campanha_contatos")
+        .update({ status_envio: "enviado", enviado_em: new Date().toISOString() })
+        .eq("id", contato.id);
+
+      await registrarMensagem({
+        telefone: telefoneDestino,
+        texto: mensagemTexto,
+        nomeContato: contato.lead?.nome ?? null,
+        direcao: "saida",
+        waMessageId: resultado?.key?.id ?? null,
+        criadoEm: new Date().toISOString(),
+        contarNaoLida: false,
+      });
+
+      console.log(`[bridge] Campanha: mensagem enviada para ${telefoneDestino}`);
+    } catch (err) {
+      console.error("[bridge] Erro ao enviar mensagem de campanha:", err);
+      await supabase
+        .from("campanha_contatos")
+        .update({
+          status_envio: "erro",
+          erro: err instanceof Error ? err.message : "Erro ao enviar.",
+          tentativas: (contato.tentativas ?? 0) + 1,
+        })
+        .eq("id", contato.id);
+    }
+  } catch (err) {
+    console.error("[bridge] Erro no processador de campanhas:", err);
+  }
+}
+
 async function main() {
   await iniciarConexao();
+  setInterval(processarCampanhas, 20_000);
 
   const app = express();
   app.use(express.json());
