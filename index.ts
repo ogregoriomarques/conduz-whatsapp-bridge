@@ -164,14 +164,14 @@ async function sincronizarHistorico(chats: Chat[], contacts: Contact[], messages
     if (c.id && nome) nomesPorJid.set(c.id, nome);
   }
 
-  const chatsValidos = chats.filter((c) => c.id && !c.id.endsWith("@g.us"));
+  const chatsValidos = chats.filter((c) => c.id && c.id.endsWith("@s.whatsapp.net"));
   await processarLote(chatsValidos, 5, async (chat) => {
     const telefone = limparNumero(chat.id);
     if (!telefone) return;
     await garantirConversa(telefone, nomesPorJid.get(chat.id) ?? null);
   });
 
-  const msgsValidas = messages.filter((m) => m.message && m.key.remoteJid && !m.key.remoteJid.endsWith("@g.us"));
+  const msgsValidas = messages.filter((m) => m.message && m.key.remoteJid?.endsWith("@s.whatsapp.net"));
   await processarLote(msgsValidas, 5, async (msg) => {
     const telefone = limparNumero(msg.key.remoteJid ?? "");
     if (!telefone) return;
@@ -241,7 +241,7 @@ async function iniciarConexao() {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.remoteJid?.endsWith("@g.us")) continue; // ignora grupos
+      if (!msg.message || !msg.key.remoteJid?.endsWith("@s.whatsapp.net")) continue; // ignora grupos, status e @lid
 
       const telefone = limparNumero(msg.key.remoteJid ?? "");
       if (!telefone) continue;
