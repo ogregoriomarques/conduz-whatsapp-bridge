@@ -328,6 +328,12 @@ async function iniciarConexao() {
       const direcao = msg.key.fromMe ? "saida" : "entrada";
       const loc = conteudoNormalizado(msg)?.locationMessage;
       const tipoMidia = detectarTipoMidia(msg);
+      const textoMsg = extrairTexto(msg);
+
+      // Envio multi-dispositivo gera ecos secundários sem conteúdo real (sender-key-distribution etc).
+      // Como as mensagens que nós mesmos enviamos via /enviar já são gravadas ali mesmo, ignora esses ecos vazios.
+      if (direcao === "saida" && textoMsg === "[mídia]" && !tipoMidia && !loc) continue;
+
       let midiaUpload: { url: string; nome: string } | null = null;
       if (tipoMidia) {
         midiaUpload = await baixarEUpload(msg, tipoMidia);
@@ -335,7 +341,7 @@ async function iniciarConexao() {
 
       await registrarMensagem({
         telefone,
-        texto: extrairTexto(msg),
+        texto: textoMsg,
         nomeContato: msg.pushName ?? null,
         direcao,
         waMessageId: msg.key.id ?? null,
