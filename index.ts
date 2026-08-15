@@ -1,3 +1,4 @@
+// Redeploy de teste (força reinício pra rodar as automações imediatamente).
 import "dotenv/config";
 import express from "express";
 import QRCode from "qrcode";
