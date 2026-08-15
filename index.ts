@@ -151,6 +151,12 @@ async function atualizarStatus(
   if (error) console.error("[bridge] Erro ao atualizar status:", error.message);
 }
 
+// Nome da empresa configurado em /empresa — substitui {empresa} nos templates, junto com {nome}.
+async function obterNomeEmpresa(): Promise<string> {
+  const { data } = await supabase.from("config_empresa").select("nome_empresa").eq("id", 1).maybeSingle();
+  return data?.nome_empresa ?? "";
+}
+
 async function vincularLead(conversaId: string, vendedorId: string, telefone: string) {
   const ultimosDigitos = telefone.slice(-8);
   const { data: leadMatch } = await supabase
@@ -473,7 +479,10 @@ async function processarCampanhas() {
         .select("mensagem")
         .eq("id", contato.campanha.template_id)
         .single();
-      mensagemTexto = (template?.mensagem ?? "").replace(/\{nome\}/g, contato.lead?.nome ?? "");
+      const nomeEmpresa = await obterNomeEmpresa();
+      mensagemTexto = (template?.mensagem ?? "")
+        .replace(/\{nome\}/g, contato.lead?.nome ?? "")
+        .replace(/\{empresa\}/g, nomeEmpresa);
     }
 
     try {
@@ -546,11 +555,13 @@ async function processarGatilhoIndicacao() {
     }
     if (!leadsElegiveis || leadsElegiveis.length === 0) return;
 
+    const nomeEmpresa = await obterNomeEmpresa();
+
     for (const lead of leadsElegiveis) {
       const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
       if (!telefoneDestino || !obterSocket(lead.vendedor_id)) continue;
 
-      const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "");
+      const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "").replace(/\{empresa\}/g, nomeEmpresa);
 
       try {
         const jid = await resolverJid(lead.vendedor_id, telefoneDestino);
