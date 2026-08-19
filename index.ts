@@ -540,12 +540,19 @@ async function processarCampanhas() {
       .maybeSingle();
     const limiteHoje = limiteDiarioAquecimento(statusVendedor?.conectado_desde ?? null);
     const inicioHojeBrasil = `${new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 10)}T03:00:00.000Z`;
+    // Se o número trocou hoje, a contagem começa em conectado_desde (não na meia-noite) — senão
+    // mensagens enviadas mais cedo pelo número ANTIGO contariam contra o limite do número novo,
+    // travando o disparo mesmo sem nenhuma mensagem real ter saído por esse número ainda.
+    const inicioContagem =
+      statusVendedor?.conectado_desde && statusVendedor.conectado_desde > inicioHojeBrasil
+        ? statusVendedor.conectado_desde
+        : inicioHojeBrasil;
     const { count: enviadasHojePorVendedor } = await supabase
       .from("whatsapp_mensagens")
       .select("id, conversa:whatsapp_conversas!inner(vendedor_id)", { count: "exact", head: true })
       .eq("direcao", "saida")
       .eq("conversa.vendedor_id", vendedorId)
-      .gte("criado_em", inicioHojeBrasil);
+      .gte("criado_em", inicioContagem);
     if ((enviadasHojePorVendedor ?? 0) >= limiteHoje) {
       console.log(`[bridge] Vendedor ${vendedorId}: limite diário de aquecimento atingido (${enviadasHojePorVendedor}/${limiteHoje}), aguardando.`);
       return;
