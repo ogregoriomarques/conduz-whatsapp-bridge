@@ -28,6 +28,11 @@ type MidiaTipo = "imagem" | "audio" | "video" | "documento" | "localizacao" | "e
 // Cada vendedor conecta o próprio número — uma sessão Baileys independente por vendedor_id.
 const sockets = new Map<string, WASocket>();
 const conectando = new Set<string>();
+// Guarda a função de limpar sessão (arquivos locais + linhas no Supabase) de cada vendedor
+// conectado, pra /desconectar poder apagar a sessão de verdade e liberar um QR code novo pra
+// um número diferente — sem isso, desconectar só derrubaria o socket e o próximo /conectar
+// tentaria restaurar a sessão antiga em vez de gerar um QR novo.
+const limpezasSessao = new Map<string, () => Promise<void>>();
 
 function obterSocket(vendedorId: string): WASocket | null {
   return sockets.get(vendedorId) ?? null;
@@ -345,7 +350,8 @@ async function iniciarConexao(vendedorId: string) {
   conectando.add(vendedorId);
 
   try {
-    const { state, saveCreds } = await criarAuthStorePersistente(vendedorId);
+    const { state, saveCreds, limparSessao } = await criarAuthStorePersistente(vendedorId);
+    limpezasSessao.set(vendedorId, limparSessao);
 
     const sock = makeWASocket({
       auth: state,
@@ -385,10 +391,19 @@ async function iniciarConexao(vendedorId: string) {
 
         sockets.delete(vendedorId);
         conectando.delete(vendedorId);
-        await atualizarStatus(vendedorId, { conectado: false });
         console.log(`[bridge] Vendedor ${vendedorId}: conexão fechada. Deslogado?`, deslogado);
 
-        if (!deslogado) {
+        if (deslogado) {
+          // Deslogado pelo celular (ou via /desconectar) — limpa a sessão salva pra não tentar
+          // restaurar credenciais mortas no próximo /conectar, o que impediria um QR code novo.
+          const limpar = limpezasSessao.get(vendedorId);
+          if (limpar) {
+            await limpar().catch((err) => console.error(`[bridge] Erro ao limpar sessão de ${vendedorId}:`, err));
+            limpezasSessao.delete(vendedorId);
+          }
+          await atualizarStatus(vendedorId, { conectado: false, numero_conectado: null, qr_code: null });
+        } else {
+          await atualizarStatus(vendedorId, { conectado: false });
           setTimeout(() => iniciarConexao(vendedorId), 3000);
         }
       }
@@ -681,6 +696,49 @@ async function main() {
 
     iniciarConexao(vendedorId).catch((err) => console.error(`[bridge] Erro ao iniciar conexão de ${vendedorId}:`, err));
     res.json({ ok: true, jaConectado: false });
+  });
+
+  // Derruba a sessão atual e apaga as credenciais salvas — depois de chamar isso, o próximo
+  // /conectar gera um QR code do zero (pra trocar de número, por exemplo).
+  app.post("/desconectar", async (req, res) => {
+    if (req.header("x-bridge-key") !== BRIDGE_API_KEY) {
+      return res.status(401).json({ error: "Não autorizado." });
+    }
+
+    const { vendedorId } = req.body as { vendedorId?: string };
+    if (!vendedorId) {
+      return res.status(400).json({ error: "vendedorId é obrigatório." });
+    }
+
+    const sock = obterSocket(vendedorId);
+    if (!sock) {
+      // Sem sessão ativa — ainda assim garante que sessão salva/status não fiquem presos.
+      const limpar = limpezasSessao.get(vendedorId);
+      if (limpar) {
+        await limpar().catch(() => {});
+        limpezasSessao.delete(vendedorId);
+      }
+      await atualizarStatus(vendedorId, { conectado: false, numero_conectado: null, qr_code: null });
+      return res.json({ ok: true, jaDesconectado: true });
+    }
+
+    try {
+      // sock.logout() dispara o evento connection.update (close, loggedOut) que já cuida de
+      // limpar a sessão salva e o status — não duplica a limpeza aqui.
+      await sock.logout();
+    } catch (err) {
+      console.error(`[bridge] Erro ao desconectar ${vendedorId}, limpando manualmente:`, err);
+      sockets.delete(vendedorId);
+      conectando.delete(vendedorId);
+      const limpar = limpezasSessao.get(vendedorId);
+      if (limpar) {
+        await limpar().catch(() => {});
+        limpezasSessao.delete(vendedorId);
+      }
+      await atualizarStatus(vendedorId, { conectado: false, numero_conectado: null, qr_code: null });
+    }
+
+    res.json({ ok: true });
   });
 
   app.post("/enviar", async (req, res) => {
