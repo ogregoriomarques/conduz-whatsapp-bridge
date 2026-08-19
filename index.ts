@@ -649,11 +649,15 @@ async function main() {
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
   processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho inicial:", err));
   processarGatilhoIndicacao().catch((err) => console.error("[automacao] Erro no gatilho de indicação inicial:", err));
+  // 3h (era 1h) — nenhuma dessas rotinas precisa de precisão de hora em hora (backup já se
+  // autolimita a uma vez por dia; os gatilhos de inatividade/indicação lidam com prazos de dias),
+  // e cada rodada varre leads inteiros. Reduzir a frequência tira uma fonte periódica de carga do
+  // banco, que está no plano free perto do limite de CPU/RAM.
   setInterval(() => {
     rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup:", err));
     processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho:", err));
     processarGatilhoIndicacao().catch((err) => console.error("[automacao] Erro no gatilho de indicação:", err));
-  }, 60 * 60 * 1000);
+  }, 3 * 60 * 60 * 1000);
 
   const app = express();
   app.use(express.json());
