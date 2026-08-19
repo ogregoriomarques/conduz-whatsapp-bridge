@@ -160,7 +160,7 @@ function extrairTimestamp(msg: WAMessage): string {
 
 async function atualizarStatus(
   vendedorId: string,
-  dados: { conectado?: boolean; numero_conectado?: string | null; qr_code?: string | null }
+  dados: { conectado?: boolean; numero_conectado?: string | null; qr_code?: string | null; conectado_desde?: string | null }
 ) {
   const { error } = await supabase
     .from("whatsapp_bridge_status")
@@ -381,8 +381,22 @@ async function iniciarConexao(vendedorId: string) {
 
       if (connection === "open") {
         const numero = sock.user?.id ? limparNumero(sock.user.id) : null;
-        await atualizarStatus(vendedorId, { conectado: true, numero_conectado: numero, qr_code: null });
-        console.log(`[bridge] Vendedor ${vendedorId}: conectado ao WhatsApp:`, numero);
+        // Só reinicia a contagem de "aquecimento" se o número mudou de verdade — uma reconexão do
+        // mesmo número (queda de rede, restart do serviço) não deve fazer o número perder o
+        // histórico de dias já aquecidos.
+        const { data: statusAnterior } = await supabase
+          .from("whatsapp_bridge_status")
+          .select("numero_conectado")
+          .eq("vendedor_id", vendedorId)
+          .maybeSingle();
+        const numeroMudou = statusAnterior?.numero_conectado !== numero;
+        await atualizarStatus(vendedorId, {
+          conectado: true,
+          numero_conectado: numero,
+          qr_code: null,
+          ...(numeroMudou ? { conectado_desde: new Date().toISOString() } : {}),
+        });
+        console.log(`[bridge] Vendedor ${vendedorId}: conectado ao WhatsApp:`, numero, numeroMudou ? "(número novo, aquecimento reiniciado)" : "");
       }
 
       if (connection === "close") {
@@ -459,11 +473,25 @@ async function iniciarConexao(vendedorId: string) {
 // Processa um contato agendado de campanha por vez — o espaçamento entre disparos já foi
 // pré-calculado pelo CRM (agendado_para); aqui só respeitamos o relógio e enviamos quando chegar a vez.
 // Cada lead pertence a um vendedor, e o envio sai pela conexão WhatsApp *daquele* vendedor.
+// Número recém-conectado sem histórico é o que mais chama atenção do sistema anti-spam do
+// WhatsApp — por isso o volume diário sobe aos poucos conforme o número vai "envelhecendo" na
+// conexão (não desde que o vendedor existe: reconecta o mesmo número não reinicia a contagem, só
+// trocar de número reinicia). Depois de 14 dias, sem limite artificial daqui.
+function limiteDiarioAquecimento(conectadoDesde: string | null): number {
+  if (!conectadoDesde) return 20;
+  const dias = (Date.now() - new Date(conectadoDesde).getTime()) / (24 * 60 * 60 * 1000);
+  if (dias < 1) return 20;
+  if (dias < 3) return 40;
+  if (dias < 7) return 80;
+  if (dias < 14) return 150;
+  return 300;
+}
+
 async function processarCampanhas() {
   try {
     const { data: contatos, error } = await supabase
       .from("campanha_contatos")
-      .select("id, tentativas, campanha:campanhas!inner(status, canal, template_id), lead:leads(nome, telefone, telefone_secundario, vendedor_id)")
+      .select("id, tentativas, campanha:campanhas!inner(id, status, canal, template_id), lead:leads(nome, telefone, telefone_secundario, vendedor_id)")
       .eq("status_envio", "agendado")
       .lte("agendado_para", new Date().toISOString())
       .eq("campanha.status", "ativa")
@@ -480,7 +508,7 @@ async function processarCampanhas() {
     const contato = contatos[0] as unknown as {
       id: string;
       tentativas: number;
-      campanha: { template_id: string | null };
+      campanha: { id: string; template_id: string | null };
       lead: { nome: string; telefone: string | null; telefone_secundario: string | null; vendedor_id: string } | null;
     };
 
@@ -503,17 +531,54 @@ async function processarCampanhas() {
       return;
     }
 
+    // Aquecimento: se o número ainda é novo e já bateu o limite do dia, não manda e nem marca erro —
+    // só deixa "agendado" mesmo, o próximo ciclo tenta de novo (e o limite sobe conforme os dias passam).
+    const { data: statusVendedor } = await supabase
+      .from("whatsapp_bridge_status")
+      .select("conectado_desde")
+      .eq("vendedor_id", vendedorId)
+      .maybeSingle();
+    const limiteHoje = limiteDiarioAquecimento(statusVendedor?.conectado_desde ?? null);
+    const inicioHojeBrasil = `${new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 10)}T03:00:00.000Z`;
+    const { count: enviadasHojePorVendedor } = await supabase
+      .from("whatsapp_mensagens")
+      .select("id, conversa:whatsapp_conversas!inner(vendedor_id)", { count: "exact", head: true })
+      .eq("direcao", "saida")
+      .eq("conversa.vendedor_id", vendedorId)
+      .gte("criado_em", inicioHojeBrasil);
+    if ((enviadasHojePorVendedor ?? 0) >= limiteHoje) {
+      console.log(`[bridge] Vendedor ${vendedorId}: limite diário de aquecimento atingido (${enviadasHojePorVendedor}/${limiteHoje}), aguardando.`);
+      return;
+    }
+
     await supabase.from("campanha_contatos").update({ status_envio: "enviando" }).eq("id", contato.id);
 
+    // Sorteia uma entre as mensagens configuradas pra essa campanha — variar o texto reduz o risco
+    // de bloqueio por "mesma mensagem em massa" (o que já causou queda de conexão antes).
     let mensagemTexto = "";
-    if (contato.campanha.template_id) {
+    const { data: variantes } = await supabase
+      .from("campanha_templates")
+      .select("template:templates_mensagem(mensagem)")
+      .eq("campanha_id", contato.campanha.id);
+    const mensagensDisponiveis = ((variantes ?? []) as unknown as { template: { mensagem: string } | null }[])
+      .map((v) => v.template?.mensagem)
+      .filter((m): m is string => Boolean(m));
+
+    let mensagemBase: string | null = null;
+    if (mensagensDisponiveis.length > 0) {
+      mensagemBase = mensagensDisponiveis[Math.floor(Math.random() * mensagensDisponiveis.length)];
+    } else if (contato.campanha.template_id) {
       const { data: template } = await supabase
         .from("templates_mensagem")
         .select("mensagem")
         .eq("id", contato.campanha.template_id)
         .single();
+      mensagemBase = template?.mensagem ?? null;
+    }
+
+    if (mensagemBase) {
       const nomeEmpresa = await obterNomeEmpresa();
-      mensagemTexto = (template?.mensagem ?? "")
+      mensagemTexto = mensagemBase
         .replace(/\{nome\}/g, primeiroNome(contato.lead?.nome))
         .replace(/\{empresa\}/g, nomeEmpresa);
     }
