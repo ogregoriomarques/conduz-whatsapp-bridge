@@ -605,12 +605,25 @@ async function processarGatilhoIndicacao() {
   }
 }
 
+// O plano free do Render hiberra o serviço depois de ~15min sem tráfego HTTP externo — e, hibernado,
+// NADA aqui roda (nem disparo de campanha, nem automações, nem a conexão do WhatsApp fica de pé) até
+// alguma requisição de fora "acordar" o container de novo. Esse ping periódico pro próprio endereço
+// público conta como tráfego externo e evita a hibernação na grande maioria das vezes. Não é garantia
+// (um deploy, manutenção do Render, ou pico de uso ainda pode causar um cold start pontual) — o único
+// jeito 100% confiável é um plano pago do Render, que nunca hiberna.
+const URL_PUBLICA = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+function manterAcordado() {
+  fetch(`${URL_PUBLICA}/health`).catch((err) => console.error("[keep-alive] Erro ao pingar a si mesmo:", err));
+}
+
 async function main() {
   const vendedoresComSessao = await listarVendedoresComSessao();
   console.log(`[bridge] Reconectando ${vendedoresComSessao.length} sessão(ões) salva(s)...`);
   await Promise.all(vendedoresComSessao.map((vendedorId) => iniciarConexao(vendedorId)));
 
   setInterval(processarCampanhas, 20_000);
+  setInterval(manterAcordado, 10 * 60 * 1000);
 
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
   processarGatilhoInatividade().catch((err) => console.error("[automacao] Erro no gatilho inicial:", err));
