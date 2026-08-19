@@ -640,7 +640,10 @@ async function main() {
   console.log(`[bridge] Reconectando ${vendedoresComSessao.length} sessão(ões) salva(s)...`);
   await Promise.all(vendedoresComSessao.map((vendedorId) => iniciarConexao(vendedorId)));
 
-  setInterval(processarCampanhas, 20_000);
+  // 45s (era 20s) — o Supabase está no plano free (Nano), já perto do limite de CPU/RAM, e essa
+  // consulta roda o tempo todo, 24h, mesmo sem nenhuma campanha ativa. O espaçamento real entre
+  // mensagens já é medido em dezenas de segundos, então checar a cada 45s não atrasa nada na prática.
+  setInterval(processarCampanhas, 45_000);
   setInterval(manterAcordado, 10 * 60 * 1000);
 
   rodarBackupSeNecessario().catch((err) => console.error("[backup] Erro no backup inicial:", err));
