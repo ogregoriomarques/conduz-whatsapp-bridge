@@ -163,6 +163,12 @@ async function atualizarStatus(
   if (error) console.error("[bridge] Erro ao atualizar status:", error.message);
 }
 
+// Mensagens usam só o primeiro nome (ex: "João" em vez de "João da Silva Pereira") — mais
+// natural e pessoal no WhatsApp do que o nome completo cadastrado no lead.
+function primeiroNome(nomeCompleto: string | null | undefined): string {
+  return (nomeCompleto ?? "").trim().split(/\s+/)[0] || "";
+}
+
 // Nome da empresa configurado em /empresa — substitui {empresa} nos templates, junto com {nome}.
 async function obterNomeEmpresa(): Promise<string> {
   const { data } = await supabase.from("config_empresa").select("nome_empresa").eq("id", 1).maybeSingle();
@@ -493,7 +499,7 @@ async function processarCampanhas() {
         .single();
       const nomeEmpresa = await obterNomeEmpresa();
       mensagemTexto = (template?.mensagem ?? "")
-        .replace(/\{nome\}/g, contato.lead?.nome ?? "")
+        .replace(/\{nome\}/g, primeiroNome(contato.lead?.nome))
         .replace(/\{empresa\}/g, nomeEmpresa);
     }
 
@@ -583,7 +589,7 @@ async function processarGatilhoIndicacao() {
         const telefoneDestino = (lead.telefone || lead.telefone_secundario || "").replace(/\D/g, "");
         if (!telefoneDestino || !obterSocket(lead.vendedor_id)) continue;
 
-        const mensagemTexto = template.mensagem.replace(/\{nome\}/g, lead.nome ?? "").replace(/\{empresa\}/g, nomeEmpresa);
+        const mensagemTexto = template.mensagem.replace(/\{nome\}/g, primeiroNome(lead.nome)).replace(/\{empresa\}/g, nomeEmpresa);
 
         try {
           const jid = await resolverJid(lead.vendedor_id, telefoneDestino);
