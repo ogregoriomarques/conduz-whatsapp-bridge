@@ -37,6 +37,16 @@ function limparNumero(jidOuTexto: string) {
   return jidOuTexto.replace(/@.*/, "").replace(/\D/g, "");
 }
 
+// Garante o "55" (código do Brasil) na frente do número. Sem isso, um número salvo só como
+// DDD+telefone (ex: "51994439641", comum em planilhas importadas) é interpretado pelo WhatsApp
+// como um número internacional cru — e "51" também é o código de país do Peru, então o contato
+// aparece do outro lado com bandeira/país errado (Peru) em vez do DDD de Porto Alegre correto.
+function garantirCodigoPaisBrasil(numero: string): string {
+  if (numero.startsWith("55") && (numero.length === 12 || numero.length === 13)) return numero;
+  if (numero.length === 10 || numero.length === 11) return `55${numero}`;
+  return numero; // outro formato/país — não mexe.
+}
+
 // Confirma no WhatsApp se o número existe antes de mandar mensagem — sem isso, sendMessage() pode
 // "ter sucesso" (retorna um id de mensagem) para um número que não é uma conta WhatsApp válida, e a
 // mensagem nunca chega em lugar nenhum. Tenta também a variante clássica do 9º dígito de celulares
@@ -45,11 +55,13 @@ async function resolverJid(vendedorId: string, numeroBruto: string): Promise<str
   const sock = obterSocket(vendedorId);
   if (!sock) return null;
 
-  const candidatos = new Set<string>([numeroBruto]);
-  if (numeroBruto.startsWith("55") && numeroBruto.length === 13) {
-    candidatos.add(numeroBruto.slice(0, 4) + numeroBruto.slice(5)); // remove o 9
-  } else if (numeroBruto.startsWith("55") && numeroBruto.length === 12) {
-    candidatos.add(numeroBruto.slice(0, 4) + "9" + numeroBruto.slice(4)); // adiciona o 9
+  const numero = garantirCodigoPaisBrasil(numeroBruto);
+
+  const candidatos = new Set<string>([numero]);
+  if (numero.startsWith("55") && numero.length === 13) {
+    candidatos.add(numero.slice(0, 4) + numero.slice(5)); // remove o 9
+  } else if (numero.startsWith("55") && numero.length === 12) {
+    candidatos.add(numero.slice(0, 4) + "9" + numero.slice(4)); // adiciona o 9
   }
 
   for (const candidato of candidatos) {
